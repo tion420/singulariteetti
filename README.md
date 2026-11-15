@@ -25,14 +25,16 @@ In the desktop app, where `/plugin` does not run: click **+** next to the prompt
 ## What you get
 
 - **The singularity**: a black hole with an ember-and-blood-red accretion disk, a lensed halo, and a heartbeat glow. Its gravity bends the background stars into arcs.
-- **The bit field**: a sparse grid of 0s and 1s across the whole screen. A slow wave of light flows toward the hole, and the field dims softly on each heartbeat, as if the light were being pulled in. A few bits spiral into the disk.
+- **The bit field**: a sparse grid of 0s and 1s across the whole screen. A slow wave of light sweeps toward the lower right; the bits it passes brighten, drift a little the same way and fade out, and the field dims softly on each heartbeat, as if the light were being pulled in. A few bits spiral into the disk.
 - **The machine eye**: a cyan digital iris made of glowing strands, with a glinting pupil, a turning data ring, targeting arcs, a scan line, and circuit traces that carry light pulses. It appears at irregular intervals, 50 to 120 seconds apart, starting from a random point in each session. While it is open, scattered cyan "network" bits in the field light up.
+- **The finale**: the last eye of each round (about every 10 minutes) stays open. Its pupil follows your cursor where the app passes it through, or looks slowly from side to side. The bit rain freezes, and 64 bits flow next to the hole into a pyramid that spells eight characters (by default the theme's uptime as HH:MM:SS, eight bits per character, read row by row). A glowing capstone lifts off, the eye travels into it through a small gravitational lens and looks around, the pyramid crumbles back into rain, and the hole swallows the hot spot orbiting on its disk. About one round in ten it is a white hole instead, and spits a new spot out onto the orbit.
 - **Colors**: red-black surfaces and matching accent, danger, success, warning and code colors for the app itself.
 
 ## Good to know
 
 - **Where it draws**: themes are drawn by the Claude Code desktop app. The terminal and editors draw no theme. The mobile app's Remote Control view did not draw mod themes when this was written.
 - **Dark mode only.**
+- **Try the finale now**: type `/singulariteetti-testi` (or `/singulariteetti-testi valkoinen` for the white hole, `/singulariteetti-testi silmä` for an ordinary eye) in a session. The finale starts about three seconds later, and the round carries on normally after it. The timings, the message and the white-hole chance are constants at the top of `hooks/register.tsx`.
 - **Screen-friendly**: the singularity wanders very slowly (about one pixel every 7–8 seconds over a 90 × 70 area) so its bright rings never burn into one spot of an OLED screen. Large surfaces change only on a shared 1/3-second tick to keep redraws light.
 - **Reduced motion**: if your system asks for reduced motion, all animation stops.
 - **One theme at a time**: a session has a single theme, so this replaces any other mod's theme while it is installed.
