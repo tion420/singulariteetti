@@ -1,6 +1,6 @@
 {
   "name": "singulariteetti",
-  "version": "1.1.26",
+  "version": "1.1.27",
   "description": "Uhkaava scifi-teema Claude Coden työpöytäsovellukseen: punahehkuinen singulariteetti, joka sykkii, nielee bittejä ja katsoo välillä takaisin kylmällä konesilmällä.",
   "author": { "name": "tion420" },
   "license": "MIT"
