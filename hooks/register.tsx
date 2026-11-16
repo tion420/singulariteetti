@@ -1,4 +1,4 @@
-import type { Register, ThemeSetArgs } from 'claude-code'
+import type { Register, ThemeResult, ThemeSetArgs, TimerCall } from 'claude-code'
 
 import { makeColors } from './make-colors.js'
 
@@ -44,7 +44,7 @@ import { makeColors } from './make-colors.js'
 // kohtaan. Myös silmä vaeltaa aukon mukana. Kuumin väri on himmeä, ei valkoinen.
 
 type Viestilahde = 'paallaoloaika' | 'kellonaika' | 'teksti'
-type Testitila = 'pois' | 'finaali' | 'valkoinen' | 'silma'
+type Testitila = 'pois' | 'finaali' | 'valkoinen' | 'silma' | 'lepo'
 
 // ═══ Säädettävät arvot ═══════════════════════════════════════════════════════
 
@@ -100,6 +100,11 @@ const LEIJUNTA = 10
 // testaamatta (/singulariteetti-testi raskas yli minuutin).
 const KIEKON_ASKELEET = 12
 
+// Silmän ja finaalin liike: askelta sekunnissa (1.1.14: 12, samoin kuin muu kuva, ja kaikki
+// askeleet samoilla hetkillä). Sulava liike (0) piirtää kuvan joka näytön virkistyksellä:
+// finaali jäädytti taustan joka kerta ja silmä nosti kuorman 80-90 %:iin (mitattu 16.11.2026).
+const SILMAN_ASKELEET = 12
+
 // ═════════════════════════════════════════════════════════════════════════════
 
 const { theme, problems } = makeColors({
@@ -154,6 +159,12 @@ const HOLE = `translate(${PX} ${PY}) rotate(${TILT})`
 
 // Vaellus: aukko siirtyy yksikön kerrallaan edestakaisin kummallakin akselilla.
 // Eri pituiset kierrokset (704 s ja 476 s) kattavat koko alueen tasaisesti.
+// 1.1.25: hidas vaellus ja kaarten kierto EIVÄT ole enää animaatioita. Koko ruudun ikkunassa (2560×1440)
+// tausta jäätyi noin 90 s latauksesta aina, kun kaikki animaatioryhmät olivat päällä yhtä aikaa; ilman
+// näitä kolmea (driftX, driftY, lensArcs) kuva pyöri (koe k1, 16.11.2026). OLED-suojana aukko saa nyt
+// satunnaisen pienen siirron ja kaaret satunnaisen kulman JOKA LATAUKSELLA (ks. jitter).
+const HIDAS_LIIKE: boolean = false
+const jitter = (max: number): number => Math.round((Math.random() * 2 - 1) * max)
 const DRIFT_X = 44 // yksikköä keskeltä kumpaankin suuntaan
 const DRIFT_Y = 34
 const DRIFT_X_STEP = 8 // sekuntia yksikköä kohden, TICKin monikerta
@@ -165,8 +176,10 @@ const LENS_SECONDS = 400
 // Syke: 16 TICKiä, kaksoislyönti (lub-dub) alussa. Hehku leimahtaa, bittikenttä himmenee.
 const BEAT_SECONDS = 16 * TICK
 
-// Kiekon kuuma kohta kiertää kerran tässä ajassa.
-const SPOT_SECONDS = 8
+// Kiekon kuuma kohta kiertää kerran tässä ajassa (1.1.10: 8 → 16 s, ja se etenee samoin
+// askelin kuin renkaat, 12/s; hehkuva häntä pehmentää askeleet). 24 askelta/s kaksinkertaisti
+// taustan ruudut sekunnissa ja sen myötä näytönohjaimen kuorman (mitattu 16.11.2026).
+const SPOT_SECONDS = 16
 
 // Bittikentän valoaallot (ks. bittikenttä alempana).
 const WAVE_SECONDS = 24
@@ -253,15 +266,21 @@ const FALL_FRAMES = Math.max(1, Math.round((FALL_SECONDS * FRAME_RATE) / FALL_ST
 // Satunnainen aloituskohta: joka teeman piirrolla arvotaan, mistä kohtaa jaksoa
 // silmä aloittaa. Kohta osuu aina johonkin taukoon (ei kesken esityksen), ja
 // seuraavaan silmään jää vähintään EYE_FIRST_MIN sekuntia. Testitilassa finaali
-// alkaa TEST_LEAD sekunnin kuluttua. Kohta on TICKin monikerta.
+// alkaa `lead` sekunnin kuluttua. Mittaustila 'lepo' alkaa pisimmän tauon alusta,
+// joten silmää ei näy vähintään 50 sekuntiin. Kohta on TICKin monikerta.
 const EYE_FIRST_MIN = 20
 const TEST_LEAD = 3
-const eyeOffset = (test: Testitila): number => {
+const eyeOffset = (test: Testitila, lead = TEST_LEAD): number => {
   if (test === 'silma') {
-    return (EYE_STARTS[0] ?? 0) * TICK - TEST_LEAD
+    return (EYE_STARTS[0] ?? 0) * TICK - lead
+  }
+  if (test === 'lepo') {
+    const longest = pauseTicks.indexOf(Math.max(...pauseTicks))
+
+    return ((EYE_STARTS[longest] ?? 0) - (pauseTicks[longest] ?? 0)) * TICK
   }
   if (test !== 'pois') {
-    return FIN_START - TEST_LEAD
+    return FIN_START - lead
   }
   const i = Math.floor(Math.random() * SHOWS)
   const pause = pauseTicks[i] ?? 0
@@ -274,8 +293,113 @@ const eyeOffset = (test: Testitila): number => {
 // kohdalla sama kulku; viimeisellä esityksellä finaalin kulku. Kulun ajat ovat
 // sekunteja esityksen alusta.
 type Step = [number, string]
+
+// Silmän ja finaalin liikkeen portaat sekunnissa (0 = sulava, kuten ennen). buildScene
+// asettaa tämän ennen avainkehysten rakentamista ja palauttaa nollaksi lopuksi.
+// Portaittain jokainen kohta pyöristetään askelruudukkoon, ja välit etenevät kokonaisin
+// askelin: kuva päivittyy vain askelten kohdalla eikä joka näytön virkistyksellä.
+let motionRate = 0
+const quant = (seconds: number): number => (motionRate > 0 ? Math.round(seconds * motionRate) / motionRate : seconds)
+const stepTiming = (from: number, to: number): string =>
+  motionRate > 0 ? ` animation-timing-function:steps(${Math.max(1, Math.round((to - from) * motionRate))});` : ''
+// Pisteet (aika, tyyli) avainkehyksiksi: saman hetken tyylit yhdistetään, ja kukin väli
+// saa askeleensa. Muuttumaton väli ei tarvitse askelia (ei muutosta, ei ruutuja).
+// Jokainen kehys täydennetään kaikilla ominaisuuksilla (puuttuva arvo interpoloidaan
+// naapureista tai jatketaan): muuten puuttuvan ominaisuuden väli olisi pidempi kuin
+// `steps(n)` olettaa, ja askeleet osuisivat ruudukon ulkopuolelle (mitattu 16.11.2026:
+// noin 50 eri muutoshetkeä sekunnissa finaalissa). Myös 0 % ja 100 % ovat aina mukana,
+// koska selaimen implisiittiset päätykehykset interpoloivat sulavasti.
+const NUMBER = /-?\d+(?:\.\d+)?/g
+const parseCss = (css: string): Map<string, string> => {
+  const props = new Map<string, string>()
+  for (const part of css.split(';')) {
+    const colon = part.indexOf(':')
+    if (colon > 0) {
+      props.set(part.slice(0, colon).trim(), part.slice(colon + 1).trim())
+    }
+  }
+
+  return props
+}
+const lerpValue = (a: string, b: string, u: number): string => {
+  if (a.replace(NUMBER, '#') !== b.replace(NUMBER, '#')) {
+    return a
+  }
+  const target = b.match(NUMBER) ?? []
+  let i = 0
+
+  return a.replace(NUMBER, x => {
+    const to = Number(target[i++] ?? x)
+
+    return num(Number(x) + (to - Number(x)) * u, 3)
+  })
+}
+const steppedFrames = (points: Step[], total: number, digits: number): string => {
+  const byTime = new Map<number, Map<string, string>>()
+  for (const [t, css] of points) {
+    const key = Math.min(total, Math.max(0, quant(t)))
+    const props = byTime.get(key) ?? new Map<string, string>()
+    for (const [name, value] of parseCss(css)) {
+      props.set(name, value)
+    }
+    byTime.set(key, props)
+  }
+  for (const end of [0, total]) {
+    if (!byTime.has(end)) {
+      byTime.set(end, new Map<string, string>())
+    }
+  }
+  const times = [...byTime.keys()].sort((a, b) => a - b)
+  const names = [...new Set([...byTime.values()].flatMap(props => [...props.keys()]))]
+  const filled = times.map(t => {
+    const own = byTime.get(t) ?? new Map<string, string>()
+    const decls = names.map(name => {
+      const value = own.get(name)
+      if (value !== undefined) {
+        return `${name}: ${value};`
+      }
+      const before = times.filter(s => s < t && byTime.get(s)?.has(name) === true).pop()
+      const after = times.find(s => s > t && byTime.get(s)?.has(name) === true)
+      const a = before === undefined ? undefined : byTime.get(before)?.get(name)
+      const b = after === undefined ? undefined : byTime.get(after)?.get(name)
+      const v =
+        a !== undefined && b !== undefined && before !== undefined && after !== undefined
+          ? lerpValue(a, b, (t - before) / (after - before))
+          : (a ?? b ?? '')
+
+      return `${name}: ${v};`
+    })
+
+    return decls.join(' ')
+  })
+
+  return times
+    .map((t, i) => {
+      const css = filled[i] ?? ''
+      const next = times[i + 1]
+      const timing = next === undefined || filled[i + 1] === css ? '' : stepTiming(t, next)
+
+      return `${num((t / total) * 100, digits)}% { ${css}${timing} }`
+    })
+    .join(' ')
+}
+
 const eyeKeyframes = (name: string, rest: string, steps: Step[], finale: Step[] = steps): string => {
   const at = (seconds: number): string => `${((seconds / EYE_SECONDS) * 100).toFixed(4)}%`
+  if (motionRate > 0) {
+    const points: Step[] = [[0, rest]]
+    EYE_STARTS.forEach((startTick, i) => {
+      const start = startTick * TICK
+      points.push([start, rest])
+      for (const [t, css] of i === SHOWS - 1 ? finale : steps) {
+        points.push([start + t, css])
+      }
+      points.push([start + showTicks(i) * TICK, rest])
+    })
+    points.push([EYE_SECONDS, rest])
+
+    return `@keyframes ${name} { ${steppedFrames(points, EYE_SECONDS, 4)} }`
+  }
   const frames = [`0% { ${rest} }`]
   EYE_STARTS.forEach((startTick, i) => {
     const start = startTick * TICK
@@ -293,6 +417,9 @@ const eyeKeyframes = (name: string, rest: string, steps: Step[], finale: Step[] 
 // Finaalin omat avainkehykset: ajat sekunteina finaalin alusta, kesto `total`.
 // Saman hetken askeleet yhdistetään.
 const frames = (name: string, total: number, ...lists: Step[][]): string => {
+  if (motionRate > 0) {
+    return `@keyframes ${name} { ${steppedFrames(lists.flat(), total, 3)} }`
+  }
   const byTime = new Map<string, string[]>()
   for (const [t, css] of lists.flat()) {
     const key = `${num(Math.min(100, Math.max(0, (t / total) * 100)))}%`
@@ -303,8 +430,8 @@ const frames = (name: string, total: number, ...lists: Step[][]): string => {
 }
 // Portaittaiset avainkehykset: kohdat ovat osuuksia kestosta, ja ne pyöristetään
 // askeliin (FRAME_RATE), jolloin jokainen väli etenee kokonaisin askelin.
-const stepKeyframes = (name: string, seconds: number, points: [number, string][]): string => {
-  const total = Math.round(seconds * FRAME_RATE)
+const stepKeyframes = (name: string, seconds: number, points: [number, string][], rate = FRAME_RATE): string => {
+  const total = Math.round(seconds * rate)
   const at = points.map(([share, css]): [number, string] => [Math.round(share * total), css])
 
   return `@keyframes ${name} { ${at
@@ -485,8 +612,37 @@ const onDisk = (r: number, a: number): [string, string] => {
 // Kuuma kohta kiertää kiekossa. Etupuolen kopio näkyy vain radan etupuoliskolla.
 const SPOT_R = 245
 const STEPS = 32 // avainkehyksiä kierroksella; väli (1/4 s) on kokonainen määrä askelia
-const SPOT_TIMING =
-  KIEKON_ASKELEET > 0 ? `steps(${Math.max(1, Math.round((SPOT_SECONDS / STEPS) * KIEKON_ASKELEET * 2))})` : 'linear'
+// Kuuman kohdan ajoitus, kun se etenee `rate` askelta sekunnissa (0 = sulava).
+const spotTiming = (rate: number, seconds = SPOT_SECONDS): string =>
+  rate > 0 ? `steps(${Math.max(1, Math.round((seconds / STEPS) * rate))})` : 'linear'
+// Kuuman kohdan häntä: kerroksia kiekon tasossa (kaaren pituus, leveys, peittävyys, väri).
+// Katkoviiva kulkee radalla samoin askelin kuin piste, joten askeleet sulautuvat liikkeeksi.
+const TAIL_LAYERS: [number, number, number, string][] = [
+  [70, 5, 0.16, BLOOD],
+  [44, 8, 0.26, EMBER],
+  [24, 10, 0.4, EMBER],
+  [10, 12, 0.6, HOT],
+]
+const spotTail = (front: boolean, seconds: number, rate: number): string => {
+  const c = 2 * Math.PI * SPOT_R
+  const steps = Math.max(1, Math.round(seconds * Math.max(1, rate)))
+  const shape = (attrs: string): string =>
+    front
+      ? `<path d="M${SPOT_R} 0 A${SPOT_R} ${SPOT_R} 0 0 1 ${-SPOT_R} 0" fill="none" ${attrs}/>`
+      : `<circle cx="0" cy="0" r="${SPOT_R}" fill="none" ${attrs}/>`
+
+  return `<g transform="${HOLE} scale(1 ${SQUASH})">${TAIL_LAYERS.map(
+    ([len, width, alpha, color], i) =>
+      shape(
+        `class="tail" style="animation:tail${i} ${seconds}s ${rate > 0 ? `steps(${steps})` : 'linear'} infinite" stroke="${color}" stroke-width="${width}" stroke-opacity="${alpha}" stroke-linecap="round" stroke-dasharray="${num(len, 1)} ${num(c - len, 1)}"`,
+      ),
+  ).join('')}</g>`
+}
+const tailKeyframes = (): string => {
+  const c = 2 * Math.PI * SPOT_R
+
+  return TAIL_LAYERS.map(([len], i) => `@keyframes tail${i} { from { stroke-dashoffset: ${num(len, 1)}; } to { stroke-dashoffset: ${num(len - c, 1)}; } }`).join(' ')
+}
 const spotFrames: string[] = []
 const spotFrontFrames: string[] = []
 for (let k = 0; k <= STEPS; k++) {
@@ -716,10 +872,14 @@ const waveGroups = (main: Cell[][], ember: Cell[][]): string =>
 // kierroksen päästä; viimeksi alkanut voittaa. Toisin kuin CSS-animaatio, <set>
 // ei vaadi selainta käsittelemään kuvaa joka ruudunpäivityksellä. Jähmettynyt
 // kopio saa vaiheensa muuttujasta --pf (ks. frozen).
-const waveClock = Array.from(
+// 1.1.18: kello on YKSI toistuva <animate> (portaittainen luokkalista). Vanha ketju (72 <set>iä,
+// joista kukin käynnisti itsensä uudelleen: begin="…;pK.begin+24s") PYSÄHTYI Chromium 156:ssa
+// 48 s kohdalla: itseensä viittaava ajastin toimii vain kerran (todettu selainruudussa 16.11.2026).
+const waveClockChain = Array.from(
   { length: WAVE_LENGTH },
   (_, k): string => `<set id="p${k}" attributeName="class" to="p${k}" begin="${num(k * TICK)}s;p${k}.begin+${WAVE_SECONDS}s"/>`,
 ).join('')
+const waveClock = `<animate id="wclk" attributeName="class" calcMode="discrete" values="${Array.from({ length: WAVE_LENGTH }, (_, k): string => `p${k}`).join(';')}" dur="${WAVE_SECONDS}s" repeatCount="indefinite"/>`
 const wavePhase = (seconds: number): number => (Math.floor(seconds / TICK + 1e-6) % WAVE_LENGTH + WAVE_LENGTH) % WAVE_LENGTH
 
 const bits = `<g class="wc" fill="${BLOOD}">${waveClock}${waveGroups(mainWave, emberWave)}
@@ -753,55 +913,74 @@ const FIELD_CSS = `
 // kiertää 5 s:ssa (ennen 1,4 s). Tämä on kuvan ainoa joka ruudulla käsiteltävä
 // animaatio, ja se pitää myös SMIL-ajastimet ajassa: ilman sitä sovellus herättää
 // ne vain noin 10 sekunnin välein.
-const dashTiming = (seconds: number, reverse = false): string => {
+const dashTiming = (seconds: number, reverse = false, rate = KIEKON_ASKELEET): string => {
   const end = reverse ? ' reverse' : ''
-  if (KIEKON_ASKELEET <= 0) {
+  if (rate <= 0) {
     return `animation:dash ${seconds}s linear infinite${end}`
   }
-  const steps = Math.max(1, Math.round(seconds * KIEKON_ASKELEET))
+  const steps = Math.max(1, Math.round(seconds * rate))
 
-  return `animation:dash ${num(steps / KIEKON_ASKELEET, 6)}s steps(${steps}) infinite${end}`
+  return `animation:dash ${num(steps / rate, 6)}s steps(${steps}) infinite${end}`
 }
-const diskParts = (front: boolean): string => {
+// Renkaiden liiketapa: 'dash' siirtää katkoviivaa (oletus), 'kierto' kääntää rengasta
+// transformilla (sama nopeus kehää pitkin; etupuolisko rajataan), 'paikallaan' ei liiku.
+type DiskMode = 'dash' | 'kierto' | 'paikallaan'
+type DiskMotion = { rate: number; mode: DiskMode }
+const DISK_DEFAULT: DiskMotion = { rate: KIEKON_ASKELEET, mode: 'dash' }
+const rotTiming = (seconds: number, r: number, rate: number, reverse = false): string => {
+  const turn = (seconds * 2 * Math.PI * r) / 160 // yksi kierros sekunteina
+  const steps = Math.max(1, Math.round(turn * Math.max(1, rate)))
+
+  return `animation:rot ${num(steps / Math.max(1, rate), 6)}s ${rate > 0 ? `steps(${steps})` : 'linear'} infinite${reverse ? ' reverse' : ''}`
+}
+const diskParts = (front: boolean, motion: DiskMotion = DISK_DEFAULT): string => {
   const shape = (r: number, attrs: string): string =>
     front
       ? `<path d="M${r} 0 A${r} ${r} 0 0 1 ${-r} 0" fill="none" ${attrs}/>`
       : `<circle cx="0" cy="0" r="${r}" fill="none" ${attrs}/>`
-  const ring = (seconds: number): string => `class="sp" style="${dashTiming(seconds)}"`
+  const spin = (r: number, seconds: number, attrs: string): string => {
+    if (motion.mode === 'paikallaan') {
+      return shape(r, attrs)
+    }
+    if (motion.mode === 'kierto') {
+      const turning = `<g style="${rotTiming(seconds, r, motion.rate)}"><circle cx="0" cy="0" r="${r}" fill="none" ${attrs}/></g>`
+
+      return front ? `<g clip-path="url(#frontHalf)">${turning}</g>` : turning
+    }
+
+    return shape(r, `class="sp" style="${dashTiming(seconds, false, motion.rate)}" ${attrs}`)
+  }
 
   return `<g transform="${HOLE} scale(1 ${SQUASH})">
     ${shape(276, `stroke="url(#disk)" stroke-width="216" stroke-opacity="0.32"`)}
-    ${shape(304, `${ring(4)} stroke="${BLOOD}" stroke-width="56" stroke-opacity="0.45" stroke-dasharray="5 11"`)}
-    ${shape(350, `${ring(11)} stroke="${BLOOD}" stroke-width="30" stroke-opacity="0.32" stroke-dasharray="2 14"`)}
-    ${shape(226, `${ring(2.5)} stroke="${EMBER}" stroke-width="40" stroke-opacity="0.5" stroke-dasharray="6 10"`)}
-    ${shape(186, `${ring(5)} stroke="${HOT}" stroke-width="18" stroke-opacity="0.5" stroke-dasharray="3 5"`)}
+    ${spin(304, 4, `stroke="${BLOOD}" stroke-width="56" stroke-opacity="0.45" stroke-dasharray="5 11"`)}
+    ${spin(350, 11, `stroke="${BLOOD}" stroke-width="30" stroke-opacity="0.32" stroke-dasharray="2 14"`)}
+    ${spin(226, 2.5, `stroke="${EMBER}" stroke-width="40" stroke-opacity="0.5" stroke-dasharray="6 10"`)}
+    ${spin(186, 5, `stroke="${HOT}" stroke-width="18" stroke-opacity="0.5" stroke-dasharray="3 5"`)}
     ${shape(170, `stroke="${HOT}" stroke-width="3" stroke-opacity="0.6"`)}
     ${shape(262, `stroke="${EMBER}" stroke-width="2" stroke-opacity="0.45"`)}
-    ${shape(382, `${ring(11)} stroke="${BLOOD}" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="2 14"`)}
+    ${spin(382, 11, `stroke="${BLOOD}" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="2 14"`)}
     ${shape(276, `class="f nv dfl" stroke="${HOT}" stroke-width="216"`)}
   </g>`
 }
+// Fotonirengas varjon reunalla (keskipiste 0, -9), sama liiketapa kuin kiekolla.
+const photonRing = (motion: DiskMotion): string => {
+  const attrs = `stroke="${HOT}" stroke-width="26" stroke-opacity="0.14" stroke-dasharray="14 18"`
+  if (motion.mode === 'paikallaan') {
+    return `<circle cx="0" cy="-9" r="${R + 20}" fill="none" ${attrs}/>`
+  }
+  if (motion.mode === 'kierto') {
+    return `<g transform="translate(0 -9)"><g style="${rotTiming(2.5, R + 20, motion.rate, true)}"><circle cx="0" cy="0" r="${R + 20}" fill="none" ${attrs}/></g></g>`
+  }
+
+  return `<circle cx="0" cy="-9" r="${R + 20}" fill="none" class="sp" style="${dashTiming(2.5, true, motion.rate)}" ${attrs}/>`
+}
 
 // ─── Silmän seuranta ─────────────────────────────────────────────────────────
-// Kursorin paikka tulee näkymättömiltä ruuduilta, joiden :hover kääntää pupillia.
-// Jos kehys ei saa hiiren liikettä (sovellus päästää painallukset taustan läpi),
-// pupilli katsoo hitaasti laidasta laitaan. Vaikuttaa vain finaalin seurantavaiheessa.
-const ZONE_COLS = 8
-const ZONE_ROWS = 5
-const zoneRects: string[] = []
-const zoneRules: string[] = []
-for (let j = 0, n = 0; j < ZONE_ROWS; j++) {
-  for (let i = 0; i < ZONE_COLS; i++, n++) {
-    const w = 1600 / ZONE_COLS
-    const h = 1000 / ZONE_ROWS
-    const dx = (i + 0.5) * w - PX
-    const dy = (j + 0.5) * h - PY
-    const len = Math.max(1, Math.hypot(dx, dy))
-    const reach = (13 * Math.min(1, len / 320)) / len
-    zoneRects.push(`<rect class="z z${n}" x="${i * w}" y="${j * h}" width="${w}" height="${h}" fill="none"/>`)
-    zoneRules.push(`.z${n}:hover ~ .stage .aimHost { --hx: ${num(dx * reach, 1)}px; --hy: ${num(dy * reach, 1)}px; }`)
-  }
-}
+// Finaalin seurantavaiheessa pupilli katsoo hitaasti laidasta laitaan (.pSweep).
+// 1.1.10 poisti kursoriseurannan (40 näkymätöntä :hover-ruutua): sovellus piirtää taustan
+// kääreeseen, joka on pointer-events: none ja inert, joten hiiri ei koskaan tavoittanut
+// ruutuja. Se vei noin 6 600 merkkiä kuvan 131 072 merkin rajasta.
 
 // ─── Finaalin silmä (tavallisen silmän animaatioiden viimeinen esitys) ──────
 const FOLLOW_END = T_FREEZE
@@ -820,11 +999,26 @@ const eyeFinale: Step[] = [
   [T_END - 0.05, 'opacity: 0; transform: translate(-4px, 1px) scale(1.06);'],
 ]
 
-// Silmän animaatiot (jakso EYE_SECONDS). Viive annetaan rakennettaessa.
-const EYE_CSS = [
+// Silmän animaatiot. Rakennetaan buildScenessä (motionRate). 1.1.12: esitys ja finaali ovat
+// omia animaatioitaan (nimi + S / F), jotka ovat olemassa vain esityksen (.pon) tai finaalin
+// (.on) ajan, eivät koko jakson. Verkkobitit vaihtuvat aina TICK-tahdissa koko jakson.
+const SHOW_SECONDS = EYE_SHOW_TICKS * TICK
+const showKeyframes = (name: string, rest: string, steps: Step[], finale: Step[] = steps): string =>
+  `@keyframes ${name}S { ${steppedFrames([[0, rest], ...steps, [SHOW_SECONDS, rest]], SHOW_SECONDS, 3)} } ` +
+  `@keyframes ${name}F { ${steppedFrames([[0, rest], ...finale, [FIN_SECONDS, rest]], FIN_SECONDS, 3)} }`
+const smooth = <T,>(build: () => T): T => {
+  const keep = motionRate
+  motionRate = 0
+  try {
+    return build()
+  } finally {
+    motionRate = keep
+  }
+}
+const eyeCss = (): string => [
   // Verkkobittien kirkkaus on ryhmän opacity (ei fill-opacity), jotta selain voi
   // vaihtaa sen valmiiseen kuvaan ilman uudelleenpiirtoa.
-  eyeKeyframes(
+  smooth(() => eyeKeyframes(
     'net',
     'opacity: 0.1;',
     [
@@ -846,8 +1040,8 @@ const EYE_CSS = [
       [T_END - 0.5, 'opacity: 0.24;'],
       [T_END - 0.2, 'opacity: 0.16;'],
     ],
-  ),
-  eyeKeyframes(
+  )),
+  showKeyframes(
     'eye',
     'opacity: 0; transform: translate(0px, 0px) scale(0.86);',
     [
@@ -861,10 +1055,10 @@ const EYE_CSS = [
     ],
     eyeFinale,
   ),
-  eyeKeyframes('eyeTurn', 'transform: rotate(-30deg);', [[7.6, 'transform: rotate(30deg);']], [
+  showKeyframes('eyeTurn', 'transform: rotate(-30deg);', [[7.6, 'transform: rotate(30deg);']], [
     [T_END - 0.1, 'transform: rotate(70deg);'],
   ]),
-  eyeKeyframes(
+  showKeyframes(
     'eyeTurnBack',
     'transform: rotate(70deg);',
     [
@@ -884,7 +1078,7 @@ const EYE_CSS = [
       [T_END - 0.1, 'transform: rotate(-24deg);'],
     ],
   ),
-  eyeKeyframes(
+  showKeyframes(
     'pupil',
     'transform: scale(1.35);',
     [
@@ -917,7 +1111,7 @@ const EYE_CSS = [
     [T_CRUMBLE + 1.8, 'stroke-dashoffset: -100;'],
     [T_CRUMBLE + 1.802, 'stroke-dashoffset: 8;'],
   ]),
-  eyeKeyframes(
+  showKeyframes(
     'scan',
     'transform: translate(0px, -90px); opacity: 0;',
     [
@@ -970,7 +1164,7 @@ const lensSteps = (inner: boolean): Step[] => {
   return out
 }
 
-const PYR_FLOW_CSS = `
+const pyrFlowCss = (): string => `
   .pb text { font-size: 14px; font-weight: 700; text-anchor: middle; }
   .pb text:first-child { opacity: calc(1 - var(--b)); }
   .pb text + text { opacity: var(--b); }
@@ -978,33 +1172,19 @@ const PYR_FLOW_CSS = `
   .pb { --mx: calc(var(--fx) * 0.42 - var(--fy) * 0.3); --my: calc(var(--fy) * 0.42 + var(--fx) * 0.3); }
   .on .pb { animation: flow ${num(FLOW_SECONDS)}s cubic-bezier(0.5, 0, 0.3, 1) var(--dl) both, crumble ${num(CRUMBLE_SECONDS)}s cubic-bezier(0.5, 0, 0.9, 0.6) var(--cl) forwards; }
   @keyframes flow {
-    0% { transform: translate(var(--fx), var(--fy)); opacity: 0; }
-    12% { opacity: 0.9; }
-    55% { transform: translate(var(--mx), var(--my)); }
+    0% { transform: translate(var(--fx), var(--fy)); opacity: 0;${stepTiming(0, 0.12 * FLOW_SECONDS)} }
+    12% { opacity: 0.9;${stepTiming(0.12 * FLOW_SECONDS, 0.55 * FLOW_SECONDS)} }
+    55% { transform: translate(var(--mx), var(--my));${stepTiming(0.55 * FLOW_SECONDS, FLOW_SECONDS)} }
     100% { transform: translate(0px, 0px); opacity: 1; }
   }
   @keyframes crumble {
-    0% { transform: translate(0px, 0px); opacity: 1; }
+    0% { transform: translate(0px, 0px); opacity: 1;${stepTiming(0, CRUMBLE_SECONDS)} }
     100% { transform: translate(var(--cx), var(--cy)); opacity: 0; }
   }`
 
-const FINALE_FIXED_CSS = `
-  .stage { pointer-events: none; }
-  .z { pointer-events: all; }
-  ${zoneRules.join('\n  ')}
-  /* 1. pupilli: --fw avaa seurantaikkunan; ilman kursoria pSweep katsoo laidasta laitaan.
-     Ei rekisteröityjä CSS-muuttujia: ne pysäyttivät sovelluksen taustan. */
-  .pAim { translate: calc(var(--fw, 0) * var(--hx, 0px)) calc(var(--fw, 0) * var(--hy, 0px)); transition: translate 0.35s ease-out; }
-  .z:hover ~ .stage .pSweep { animation: none; }
-  .on .aimHost { animation: fw ${num(FS)}s linear both; }
-  ${frames('fw', FS, [
-    [0, '--fw: 0;'],
-    [T_FOLLOW + 0.2 - 0.002, '--fw: 0;'],
-    [T_FOLLOW + 0.2, '--fw: 1;'],
-    [FOLLOW_END - 0.25, '--fw: 1;'],
-    [FOLLOW_END - 0.248, '--fw: 0;'],
-    [FS, '--fw: 0;'],
-  ])}
+const finaleFixedCss = (): string => `
+  /* 1. pupilli katsoo laidasta laitaan. Ei rekisteröityjä CSS-muuttujia: ne pysäyttivät
+     sovelluksen taustan. */
   .on .pSweep { animation: sweep ${num(FS)}s ease-in-out both; }
   ${frames('sweep', FS, [
     [0, 'translate: 0px 0px;'],
@@ -1039,7 +1219,7 @@ const FINALE_FIXED_CSS = `
   ])}
   .on .frzField { --srcAnim: srcOut; }
   .s { opacity: var(--srcOp, 1); animation: var(--srcAnim, none) 0.25s ease var(--sd) both; }
-  @keyframes srcOut { to { opacity: 0; } }
+  @keyframes srcOut { ${motionRate > 0 ? `0% {${stepTiming(0, 0.25)} } ` : ''}to { opacity: 0; } }
 
   /* 3. pyramidi */
   .on .pyr { animation: pyr ${num(FS)}s linear both; }
@@ -1053,7 +1233,7 @@ const FINALE_FIXED_CSS = `
     [T_CRUMBLE + 0.8, 'opacity: 0;'],
     [FS, 'opacity: 0;'],
   ])}
-  ${PYR_FLOW_CSS}
+  ${pyrFlowCss()}
 
   /* 4. huippukivi syttyy, nousee ja leijuu */
   .on .cap { animation: cap ${num(FS)}s linear both; }
@@ -1114,6 +1294,13 @@ type SceneOptions = {
   whiteChance: number
   now: number // millisekunteja, piirron hetki
   loadedAt: number // millisekunteja, teeman latautuminen
+  lead?: number // testitila: sekunteja silmään tai finaaliin (oletus TEST_LEAD)
+  disk?: DiskMotion // kevennyskokeet: kiekon renkaiden liike (oletus DISK_DEFAULT)
+  spotRate?: number // kevennyskokeet: kuuman kohdan askeleet/s (oletus 2 × renkaiden)
+  spotSeconds?: number // kevennyskokeet: kuuman kohdan kierros sekunteina (oletus SPOT_SECONDS)
+  spotTail?: boolean // kuumalle kohdalle häntä (oletus päällä)
+  frameRate?: number // kevennyskokeet: tuikkeen, sykkeen ja putoavien bittien askeleet/s (oletus FRAME_RATE)
+  motionRate?: number // silmän ja finaalin askeleet/s (oletus SILMAN_ASKELEET; 0 = sulava)
 }
 
 const textCodes = (text: string): number[] =>
@@ -1152,7 +1339,16 @@ const pct = (ticks: number, total: number): string => `${((ticks / total) * 100)
 const BEAT_TICKS = Math.round(BEAT_SECONDS / TICK)
 
 const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteCycles: number[] } => {
-  const offset = eyeOffset(o.test)
+  const offset = eyeOffset(o.test, o.lead)
+  const disk = o.disk ?? DISK_DEFAULT
+  const spotRate = o.spotRate ?? disk.rate
+  const spotSeconds = o.spotSeconds ?? SPOT_SECONDS
+  const SPOT_TIMING = spotTiming(spotRate, spotSeconds)
+  const tail = o.spotTail !== false
+  const tailBack = tail ? spotTail(false, spotSeconds, spotRate) : ''
+  const tailFront = tail ? spotTail(true, spotSeconds, spotRate) : ''
+  const fr = o.frameRate ?? FRAME_RATE
+  motionRate = o.motionRate ?? SILMAN_ASKELEET
   const EYE_DELAY = `${num(-offset)}s`
   const t0 = FIN_START - offset // ensimmäisen finaalin alku piirrosta, s
   const shift = -(t0 + T_FREEZE) // jähmettyneen kopion viive: sama hetki kuin elävässä
@@ -1174,12 +1370,10 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
   // ruudunpäivityksellä, toisin kuin CSS-muuttujan animaatio.
   const timeMessage = o.message !== 'teksti'
   const tens = Math.ceil(Math.ceil(86400 / EYE_SECONDS) / 10)
+  // 1.1.26: yksi toistuva <animate> numeroa kohden. Vanha muoto (count kappaletta <set>-elementtejä, jotka
+  // käynnistivät itsensä uudelleen: begin="…;cuJ.begin+…s") toimii Chromium 156:ssa vain yhden kierroksen.
   const digitSets = (name: string, base: string, count: number, span: number): string =>
-    Array.from(
-      { length: count },
-      (_, j): string =>
-        `<set id="${name}${j}" attributeName="class" to="${base} ${name}${j}" begin="${num(t0 + (j * span - 0.5) * EYE_SECONDS)}s;${name}${j}.begin+${num(count * span * EYE_SECONDS)}s"/>`,
-    ).join('')
+    `<animate id="${name}" attributeName="class" calcMode="discrete" values="${Array.from({ length: count }, (_, j): string => `${base} ${name}${j}`).join(';')}" begin="${num(t0 - 0.5 * EYE_SECONDS)}s" dur="${num(count * span * EYE_SECONDS)}s" repeatCount="indefinite"/>`
   const clockUnits = timeMessage ? digitSets('cu', 'clk', 10, 1) : ''
   const clockTens = timeMessage ? digitSets('ct', 'clk2', tens, 10) : ''
   const codes = !timeMessage
@@ -1323,12 +1517,26 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
   const showBegins = EYE_STARTS.slice(0, SHOWS - 1)
     .map(tick => (((tick * TICK - offset) % EYE_SECONDS) + EYE_SECONDS) % EYE_SECONDS)
     .sort((a, b) => a - b)
-    .map(seconds => `${num(seconds)}s`)
+  // 1.1.26: ajastimet ovat toistuvia <animate>-elementtejä (luokka päälle ja pois kierroksen sisällä).
+  // Vanha muoto (<set … begin="…;pon.begin+576s">) toistui Chromium 156:ssa vain kerran, joten silmä ja
+  // finaali olisivat loppuneet toisen kierroksen jälkeen (noin 19 min).
+  const cycleTimer = (id: string, base: string, on: string, spans: [number, number][]): string => {
+    const frac = (seconds: number): string => (Math.min(Math.max(seconds, 0), EYE_SECONDS) / EYE_SECONDS).toFixed(6)
+    const values = [base, ...spans.flatMap(() => [on, base])]
+    const keyTimes = ['0', ...spans.flatMap(([from, to]) => [frac(from), frac(to)])]
+
+    return `<animate id="${id}" attributeName="class" calcMode="discrete" values="${values.join(';')}" keyTimes="${keyTimes.join(';')}" dur="${num(EYE_SECONDS)}s" repeatCount="indefinite"/>`
+  }
   const pulseTimer =
     showBegins.length === 0
       ? ''
-      : `<set id="pon" attributeName="class" to="pw pon" begin="${showBegins.join(';')};pon.begin+${num(EYE_SECONDS)}s" dur="${num(EYE_SHOW_TICKS * TICK)}s"/>`
-  const timers = `<set id="fin" attributeName="class" to="stage on" begin="${num(t0)}s;fin.begin+${num(EYE_SECONDS)}s" dur="${num(FS)}s"/>${
+      : cycleTimer(
+          'pon',
+          'aimHost',
+          'aimHost pon',
+          showBegins.map((begin): [number, number] => [begin, begin + EYE_SHOW_TICKS * TICK]),
+        )
+  const timers = `${cycleTimer('fin', 'stage', 'stage on', [[t0, t0 + FS]])}${
     whiteCycles.length === 0
       ? ''
       : `<set attributeName="class" to="stage on white" begin="${whiteCycles.map(k => `${num(t0 + k * EYE_SECONDS)}s`).join(';')}" dur="${num(FW)}s"/>`
@@ -1440,13 +1648,13 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
     <stop offset="0.4" stop-color="${ICE_HOT}" stop-opacity="0.6"/>
     <stop offset="1" stop-color="${ICE}" stop-opacity="0"/>
   </radialGradient>
-  <clipPath id="eyeClip"><circle cx="0" cy="0" r="84"/></clipPath>
+  <clipPath id="eyeClip"><circle cx="0" cy="0" r="84"/></clipPath>${disk.mode === 'kierto' ? '<clipPath id="frontHalf"><rect x="-420" y="0" width="840" height="420"/></clipPath>' : ''}
   <clipPath id="lensClip"><circle cx="0" cy="0" r="${LENS_R}"/></clipPath>
   <path id="eyeData" d="M-97 0A97 97 0 1 1 97 0A97 97 0 1 1 -97 0"/>
 </defs>
 <style>
   /* tähdet tuikkivat ryhmittäin, portaittain (FRAME_RATE) */
-  ${TWINKLE_TIMES.map(([seconds, delay], i) => `.tw${i} { animation: tw ${seconds}s steps(${Math.round((seconds / 2) * FRAME_RATE)}) ${delay}s infinite; }`).join('\n  ')}
+  ${TWINKLE_TIMES.map(([seconds, delay], i) => `.tw${i} { animation: tw ${seconds}s steps(${Math.round((seconds / 2) * fr)}) ${delay}s infinite; }`).join('\n  ')}
   @keyframes tw { 0%, 100% { opacity: 0.12; } 50% { opacity: 0.8; } }
 
   /* syke: hehku leimahtaa kahdesti ja raukeaa, portaittain */
@@ -1458,7 +1666,7 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
     [0.14, 'opacity: 0.95;'],
     [0.32, 'opacity: 0.45;'],
     [1, 'opacity: 0.45;'],
-  ])}
+  ], fr)}
   /* samoilla lyönneillä bittikenttä hengähtää hiukan himmeämmäksi, kuin valo
      imaistaisiin: pienin askelin TICKin tahdissa, ei nykäisynä. Kentän
      animaatioilla on --shift ja --ps, joilla jähmettynyt kopio pysäytetään
@@ -1476,8 +1684,11 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
   .net { opacity: 0.1; animation: net ${EYE_SECONDS.toFixed(3)}s steps(1) infinite; animation-delay: calc(${EYE_DELAY} + var(--shift, 0s)); animation-play-state: var(--ps, running); }
 
   /* kiekon renkaiden kesto ja askeleet ovat kunkin renkaan omassa tyylissä */
-  @keyframes dash { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -160; } }
+  @keyframes dash { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -160; } }${disk.mode === 'kierto' ? ' @keyframes rot { to { transform: rotate(360deg); } }' : ''}
 
+${
+  HIDAS_LIIKE
+    ? `
   .lensArcs { animation: lensArcs ${LENS_SECONDS}s steps(${Math.round(LENS_SECONDS / TICK)}) infinite; }
   @keyframes lensArcs { to { transform: rotate(360deg); } }
 
@@ -1485,28 +1696,40 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
   .driftY { animation: driftY ${2 * DRIFT_Y * DRIFT_Y_STEP}s steps(${2 * DRIFT_Y}) ${-DRIFT_Y * DRIFT_Y_STEP}s infinite alternate; }
   @keyframes driftX { from { transform: translate(${-DRIFT_X}px, 0px); } to { transform: translate(${DRIFT_X}px, 0px); } }
   @keyframes driftY { from { transform: translate(0px, ${-DRIFT_Y}px); } to { transform: translate(0px, ${DRIFT_Y}px); } }
-
-  .spot { animation: spot ${SPOT_SECONDS}s ${SPOT_TIMING} infinite; }
-  .spotFront { animation: spotFront ${SPOT_SECONDS}s ${SPOT_TIMING} infinite; }
+`
+    : ''
+}
+  .spot { animation: spot ${spotSeconds}s ${SPOT_TIMING} infinite; }
+  .spotFront { animation: spotFront ${spotSeconds}s ${SPOT_TIMING} infinite; }${tail ? `\n  ${tailKeyframes()}` : ''}
   @keyframes spot { ${spotFrames.join(' ')} }
   @keyframes spotFront { ${spotFrontFrames.join(' ')} }
 
   /* robotin näkö välähtää päälle, tarkentaa, vilkaisee vasemmalle tekstiä kohti ja sammuu;
      kierroksen viimeisellä kerralla se jää auki finaaliin */
-  .eye { opacity: 0; animation: eye ${EYE_SECONDS.toFixed(3)}s ease-in-out ${EYE_DELAY} infinite; }
+  .eye { opacity: 0; transform: translate(0px, 0px) scale(0.86); }
+  .pon .eye { animation: eyeS ${num(SHOW_SECONDS)}s ease-in-out both; }
+  .on .eye { animation: eyeF ${num(FIN_SECONDS)}s ease-in-out both; }
   /* datakehä kiertää hitaasti koko ajan, kun silmä on auki */
-  .eyeTurn { animation: eyeTurn ${EYE_SECONDS.toFixed(3)}s linear ${EYE_DELAY} infinite; }
+  .eyeTurn { transform: rotate(-30deg); }
+  .pon .eyeTurn { animation: eyeTurnS ${num(SHOW_SECONDS)}s linear both; }
+  .on .eyeTurn { animation: eyeTurnF ${num(FIN_SECONDS)}s linear both; }
   /* tähtäinkaaret lukittuvat paikalleen ja nytkähtävät, kun katse kääntyy */
-  .eyeTurnBack { animation: eyeTurnBack ${EYE_SECONDS.toFixed(3)}s ease-in-out ${EYE_DELAY} infinite; }
+  .eyeTurnBack { transform: rotate(70deg); }
+  .pon .eyeTurnBack { animation: eyeTurnBackS ${num(SHOW_SECONDS)}s ease-in-out both; }
+  .on .eyeTurnBack { animation: eyeTurnBackF ${num(FIN_SECONDS)}s ease-in-out both; }
   /* pupilli supistuu terävästi juuri kun katse kääntyy tekstiin */
-  .pupil { animation: pupil ${EYE_SECONDS.toFixed(3)}s ease-in-out ${EYE_DELAY} infinite; }
+  .pupil { transform: scale(1.35); }
+  .pon .pupil { animation: pupilS ${num(SHOW_SECONDS)}s ease-in-out both; }
+  .on .pupil { animation: pupilF ${num(FIN_SECONDS)}s ease-in-out both; }
   /* valopulssit juoksevat johtimia pitkin ulos, kolme kertaa silmän ollessa auki */
   .pulse { stroke-dasharray: 7 200; stroke-dashoffset: 8; }
   .pon .pulse { animation: pulse ${num(EYE_SHOW_TICKS * TICK)}s linear both; }
   .on .pulse { animation: pulseF ${num(FIN_SECONDS)}s linear both; }
   /* skannausviiva: alas silmän käynnistyessä, ylös kun katse lukittuu */
-  .scan { opacity: 0; animation: scan ${EYE_SECONDS.toFixed(3)}s linear ${EYE_DELAY} infinite; }
-  ${EYE_CSS}
+  .scan { opacity: 0; transform: translate(0px, -90px); }
+  .pon .scan { animation: scanS ${num(SHOW_SECONDS)}s linear both; }
+  .on .scan { animation: scanF ${num(FIN_SECONDS)}s linear both; }
+  ${eyeCss()}
   .eyeData { font-size: 7px; letter-spacing: 1.6px; }
 
   /* harva häiriöviiva */
@@ -1519,14 +1742,14 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
   }
 
   text { font: 13px ui-monospace, Consolas, Menlo, monospace; }
-  .fall, .fallFront { opacity: 0; animation: fall ${num(FALL_SECONDS, 6)}s steps(${FALL_FRAMES}) infinite; animation-delay: calc(var(--d) + var(--shift, 0s)); animation-play-state: var(--ps, running); }
+  .fall, .fallFront { opacity: 0; animation: fall ${num(FALL_SECONDS, 6)}s steps(${Math.max(1, Math.round((FALL_FRAMES * fr) / FRAME_RATE))}) infinite; animation-delay: calc(var(--d) + var(--shift, 0s)); animation-play-state: var(--ps, running); }
   .fallFront { animation-name: fallFront; }
   .fall text, .fallFront text { font-size: 17px; }
   @keyframes fall { ${fallFrames.join(' ')} }
   @keyframes fallFront { ${fallFrontFrames.join(' ')} }
 
   ${FIELD_CSS}
-  ${FINALE_FIXED_CSS}
+  ${finaleFixedCss()}
   ${finaleCss}
 
   @media (prefers-reduced-motion: reduce) {
@@ -1534,7 +1757,6 @@ const buildScene = (o: SceneOptions): { svg: string; firstFinale: number; whiteC
     .f { display: none !important; }
   }
 </style>
-${zoneRects.join('')}
 <g class="stage">
 ${timers}
 <rect width="1600" height="1000" fill="url(#sky)"/>
@@ -1550,17 +1772,17 @@ ${bits}
 <g class="f frz frzField">${frozen('field')}</g>
 
 <!-- aukko ja kaikki sen ympärillä vaeltaa hitaasti, ettei rengas pala ruutuun -->
-<g class="driftX"><g class="driftY">
+<g class="driftX"${HIDAS_LIIKE ? '' : ` transform="translate(${jitter(DRIFT_X)} ${jitter(DRIFT_Y)})"`}><g class="driftY">
 
 <!-- taustatähdet taipuvat kaariksi aukon ympärillä -->
 <g transform="translate(${PX} ${PY})">
   <circle cx="0" cy="0" r="${R + 64}" fill="none" stroke="${EMBER}" stroke-width="1" stroke-opacity="0.12"/>
-  <g class="lensArcs">${twinkleGroups(arcs, `fill="none" stroke="${STAR}" stroke-linecap="round"`)}</g>
+  <g class="lensArcs"${HIDAS_LIIKE ? '' : ` transform="rotate(${Math.floor(Math.random() * 360)})"`}>${twinkleGroups(arcs, `fill="none" stroke="${STAR}" stroke-linecap="round"`)}</g>
 </g>
 
 <!-- takana: koko kiekko, kuuma kohta ja aukkoon valuvat bitit -->
-${diskParts(false)}
-<g class="spotW"><g class="spot"><circle cx="0" cy="0" r="6" fill="${HOT}"/></g></g>
+${diskParts(false, disk)}
+<g class="spotW">${tailBack}<g class="spot"><circle cx="0" cy="0" r="6" fill="${HOT}"/></g></g>
 <g class="f nv mealB"><circle cx="0" cy="0" r="6" fill="${HOT}"/></g>
 <g class="f nv orbB"><circle class="relit" cx="0" cy="0" r="30" fill="url(#spotGlow)"/></g>
 <g class="f wv worbB"><g class="wcool"><circle cx="0" cy="0" r="6" fill="#fff"/></g></g>
@@ -1572,7 +1794,7 @@ ${diskParts(false)}
   <circle cx="0" cy="-10" r="${R + 84}" fill="url(#glow)" class="beat"/>
   <circle class="f nv hglow" cx="0" cy="-10" r="${R + 84}" fill="url(#glow)"/>
   <circle cx="0" cy="-14" r="${R + 46}" fill="url(#halo)"/>
-  <circle cx="0" cy="-9" r="${R + 20}" fill="none" class="sp" style="${dashTiming(2.5, true)}" stroke="${HOT}" stroke-width="26" stroke-opacity="0.14" stroke-dasharray="14 18"/>
+  ${photonRing(disk)}
   <circle cx="0" cy="0" r="${R}" fill="#000"/>
   <circle class="f nv hgulp" cx="0" cy="0" r="${R}" fill="#000"/>
   <circle cx="0" cy="0" r="${R + 16}" fill="url(#rimGlow)" class="beat"/>
@@ -1586,13 +1808,13 @@ ${diskParts(false)}
 <!-- robotin näkö varjon sisällä: kylmän syaani säieiiris, mikrorenkaat ja
      kimallus, pupilli ja heijastus, datakehä, tähtäinkaaret, skannausviiva ja
      oikealle lähtevät johtimet. Finaalissa pupilli seuraa kursoria. -->
-<g class="aimHost" transform="translate(${PX} ${PY})">
+<g class="aimHost" transform="translate(${PX} ${PY})">${pulseTimer}
   <g class="eye">
     <g fill="none" stroke-width="1.2">
       <g stroke="url(#trace)">${traceParts.join('')}</g>
       <g stroke="${ICE}" stroke-opacity="0.65">${viaParts.join('')}</g>
     </g>
-    <g class="pw" fill="none" stroke="${ICE_HOT}" stroke-width="2.2" stroke-linecap="round">${pulseTimer}${pulseParts}</g>
+    <g class="pw" fill="none" stroke="${ICE_HOT}" stroke-width="2.2" stroke-linecap="round">${pulseParts}</g>
     <g id="irisArt">
       <circle cx="0" cy="0" r="92" fill="url(#iris)"/>
       <path d="${fibers.outer.join('')}" fill="none" stroke="${ICE_DEEP}" stroke-width="1.1" stroke-opacity="0.85"/>
@@ -1635,8 +1857,8 @@ ${diskParts(false)}
 </g>
 
 <!-- edessä: kiekon etupuolisko, kuuma kohta ja bitit radan etupuolella -->
-${diskParts(true)}
-<g class="spotW"><g class="spotFront">
+${diskParts(true, disk)}
+<g class="spotW">${tailFront}<g class="spotFront">
   <circle cx="0" cy="0" r="22" fill="url(#spotGlow)"/>
   <circle cx="0" cy="0" r="6" fill="${HOT}"/>
 </g></g>
@@ -1694,7 +1916,14 @@ ${diskParts(true)}
 </g>
 </svg>`
 
-  return { svg, firstFinale: t0, whiteCycles }
+  // Portaittain myös finaalin viiveet ruudukkoon (pyramidin bitit, lähtevät bitit).
+  const stepped =
+    motionRate > 0
+      ? svg.replace(/--(dl|cl|sd):(-?[\d.]+)s/g, (_, key: string, value: string) => `--${key}:${num(quant(Number(value)))}s`)
+      : svg
+  motionRate = 0
+
+  return { svg: stepped, firstFinale: t0, whiteCycles }
 }
 
 const SCENE_NAME = 'singulariteetti'
@@ -1712,10 +1941,326 @@ const LOOK = (scene: string): ThemeSetArgs => ({
   backdrop: { scene, glass: { blur: 0, tint: '#0a0607', opacity: 0.6 } },
 })
 
+// ─── Mittaussarja (/singulariteetti-testi sarja) ────────────────────────────
+// Erittelykoe kuorman mittaamiseen: kuva vaihtuu itsestään SARJA_SECONDS sekunnin
+// välein, ja vahti (_varmuuskopiot\mittarit\vahti.ps1) kirjaa kuorman. Osan hinta
+// = s0 − sX. Variantti on tavallinen kuva, johon lisätään CSS-sääntö ja josta
+// poistetaan SMIL-ajastimia. s0–s8 alkavat pisimmän tauon alusta (ei silmää).
+// Yksittäinen variantti käsin: /singulariteetti-testi s3.
+type SarjaSmil = 'kaikki' | 'pois' | 'ei kelloa' | 'vain kello'
+type SarjaVariant = {
+  id: string
+  label: string
+  test: Testitila
+  lead?: number
+  css?: string
+  smil?: SarjaSmil
+  opts?: Pick<SceneOptions, 'disk' | 'spotRate' | 'spotSeconds' | 'spotTail' | 'frameRate' | 'motionRate'>
+  // Valmis kuva sellaisenaan (ei buildScenea): erottava koe, jossa ei ole mitään teeman omaa.
+  raw?: string
+  // Lisäpiirros kuvan loppuun (ennen </svg>), esim. vilkkuvat pisteet elonmerkiksi.
+  extra?: string
+  // 'ketju' = vanha kentän kello (72 itsensä käynnistävää <set>iä, 1.1.17 ja vanhemmat) vertailuun.
+  clock?: 'ketju'
+}
+// Koe G2 (1.1.17): elonmerkki, jonka vahti näkee. 20 isoa pistettä, kirkkaus 12 askelta/s.
+const ELO_CSS = '.kd { animation: kd 2s steps(24) infinite !important; } @keyframes kd { from { fill-opacity: 0.9; } to { fill-opacity: 0.1; } }'
+const ELO_PISTEET = Array.from(
+  { length: 20 },
+  (_, i) => `<circle class="kd" style="animation-delay:-${((i * 2) / 12).toFixed(4)}s" cx="${220 + (i % 5) * 120}" cy="${200 + Math.floor(i / 5) * 120}" r="40" fill="${HOT}"/>`,
+).join('')
+// Koe G7 (1.1.23): dokumentin ikämittari. 18 neliötä, joista yksi syttyy 10 s välein dokumentin omasta
+// alusta. Jos sovellus rakentaa taustan uudelleen (uusi kehys tai kuva), neliöt alkavat taas nollasta.
+const IKA_CSS = '.ag { fill-opacity: 0.12; animation: ag 1s steps(1) both; } @keyframes ag { from { fill-opacity: 0.12; } to { fill-opacity: 1; } }'
+const IKA_NELIOT = Array.from(
+  { length: 18 },
+  (_, i) => `<rect class="ag" style="animation-delay:${(i + 1) * 10 - 1}s" x="${80 + i * 46}" y="660" width="36" height="36" fill="${ICE}"/>`,
+).join('')
+const IKA_SCENE = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice"><style>${ELO_CSS} ${IKA_CSS}</style><rect width="1600" height="1000" fill="#07040a"/>${ELO_PISTEET}${IKA_NELIOT}</svg>`
+// Kevyt kuva + kertapurske: 40 isoa ympyrää vilkkuu VAIN 12 ensimmäistä sekuntia dokumentin
+// latauksesta. Jos sovellus lataa kehyksen uudelleen (esim. 90 s kohdalla), purske näkyy lokissa uudelleen.
+const PURSKE_SCENE = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice"><style>${ELO_CSS} .b { animation: b 1s steps(12) 12 both; } @keyframes b { from { fill-opacity: 0.5; } to { fill-opacity: 0; } }</style><rect width="1600" height="1000" fill="#07040a"/>${Array.from(
+  { length: 40 },
+  (_, i) => `<circle class="b" cx="${100 + (i % 8) * 200}" cy="${100 + Math.floor(i / 8) * 200}" r="110" fill="${HOT}"/>`,
+).join('')}${ELO_PISTEET}</svg>`
+// Erottava koe G1 (1.1.16): hyvin kevyt kuva, 20 pistettä, joiden kirkkaus vaihtuu 12 askelta/s.
+// fill-opacity piirretään pääsäikeellä (ei koostajalla), joten elossa oleva kuva näkyy vahdin lokissa.
+const KEVYT_SCENE = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice"><style>.d { animation: d 2s steps(24) infinite; } @keyframes d { from { fill-opacity: 1; } to { fill-opacity: 0.1; } }</style><rect width="1600" height="1000" fill="#07040a"/>${Array.from(
+  { length: 20 },
+  (_, i) => `<circle class="d" style="animation-delay:-${((i * 2) / 12).toFixed(4)}s" cx="${420 + (i % 5) * 190}" cy="${260 + Math.floor(i / 5) * 160}" r="7" fill="${HOT}"/>`,
+).join('')}</svg>`
+const SARJA_SECONDS = 40
+const SARJA_LEAD = 15 // silmä ja finaali alkavat vasta, kun latauksen 10 s on ohi
+const offAnim = (...selectors: string[]): string => `${selectors.join(', ')} { animation: none !important; }`
+// Vain kiekko (.sp, .spot, .spotFront) ja annetut luokat saavat animoitua.
+const onlyAnim = (...keep: string[]): string =>
+  `*${['.sp', '.spot', '.spotFront', ...keep].map(c => `:not(${c})`).join('')} { animation: none !important; }`
+const ANIM_A1 = ['.driftX', '.driftY', '.lensArcs']
+const ANIM_A2 = ['.tw', '.beat', '.suck', '.net', '.gl']
+const ANIM_A3 = ['.fall', '.fallFront']
+const SARJA: SarjaVariant[] = [
+  { id: 's0', label: 'täysi kuva', test: 'lepo' },
+  { id: 's1', label: 'kaikki animaatiot ja SMIL pois', test: 'lepo', css: offAnim('*'), smil: 'pois' },
+  { id: 's2', label: 'ilman kiekon renkaiden liikettä', test: 'lepo', css: offAnim('.sp') },
+  { id: 's3', label: 'ilman kentän kelloa', test: 'lepo', smil: 'ei kelloa' },
+  { id: 's4', label: 'ilman putoavia bittejä', test: 'lepo', css: offAnim('.fall', '.fallFront') },
+  { id: 's5', label: 'ilman sykettä, imaisua ja tuiketta', test: 'lepo', css: offAnim('.beat', '.suck', '.tw') },
+  { id: 's6', label: 'ilman silmää', test: 'lepo', css: `.eye, .net { display: none !important; } ${offAnim('.eye', '.eye *', '.net')}` },
+  { id: 's7', label: 'vain kiekko', test: 'lepo', css: '*:not(.sp):not(.spot):not(.spotFront) { animation: none !important; }', smil: 'pois' },
+  { id: 's8', label: 'vain kenttä', test: 'lepo', css: offAnim('*'), smil: 'vain kello' },
+  { id: 's9', label: `silmän esitys (${SARJA_LEAD} s kohdalla)`, test: 'silma', lead: SARJA_LEAD },
+  { id: 's10', label: `finaali (${SARJA_LEAD} s kohdalla)`, test: 'finaali', lead: SARJA_LEAD },
+]
+const sarjaScene = (variant: SarjaVariant, now: number, loaded: number): string => {
+  if (variant.raw !== undefined) {
+    return variant.raw
+  }
+  let svg = buildScene({ ...sceneOptions(variant.test, now, loaded), lead: variant.lead, ...variant.opts }).svg
+  if (variant.clock === 'ketju') {
+    svg = svg.replace(waveClock, waveClockChain)
+  }
+  const smil = variant.smil ?? 'kaikki'
+  if (smil !== 'kaikki') {
+    svg = svg.replace(/<(?:set|animate) [^>]*\/>/g, set => {
+      const clock = /^<set id="p\d+"/.test(set) || set.startsWith('<animate id="wclk"')
+
+      return smil === 'pois' || (smil === 'ei kelloa' && clock) || (smil === 'vain kello' && !clock) ? '' : set
+    })
+  }
+
+  if (variant.extra !== undefined) {
+    svg = svg.replace(/<\/svg>\s*$/, `${variant.extra}</svg>`)
+  }
+
+  return variant.css === undefined ? svg : svg.replace('</style>', `  ${variant.css}\n</style>`)
+}
+const clockText = (ms: number): string => {
+  const d = new Date(ms)
+  const pad = (v: number): string => String(v).padStart(2, '0')
+
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+let seriesTimers: { cancel: () => void }[] = []
+
+// ─── Kevennyskokeet (K3) ─────────────────────────────────────────────────────
+// Variantit, joita ajetaan automaattisesti (AUTOKOE) tai käsin (/singulariteetti-testi d3).
+// Kaikki tilassa 'lepo' (ei silmää mittausikkunassa), ellei toisin mainita.
+// d0–d8 = erä K3-1 (1.1.7–1.1.9): kuuma kohta vanhoilla asetuksilla (8 s, ei häntää).
+const OLD_SPOT = { spotSeconds: 8, spotTail: false }
+const FIN12 = { motionRate: 12, spotTail: false }
+const NO_LENS = ' .lens { display: none !important; }'
+const NO_FRZ = ' .frz { display: none !important; } .on .live { animation: none !important; }'
+const NO_PYR = ' .pyr, .pglow { display: none !important; }'
+const KEVENNYS: SarjaVariant[] = [
+  { id: 'd0', label: 'kiekko 1.1.9 (renkaat 12/s, piste 24/s)', test: 'lepo', opts: { ...OLD_SPOT, spotRate: 24 } },
+  { id: 'd1', label: 'renkaat 6/s, piste 12/s', test: 'lepo', opts: { ...OLD_SPOT, disk: { rate: 6, mode: 'dash' }, spotRate: 12 } },
+  { id: 'd2', label: 'renkaat 4/s, piste 8/s', test: 'lepo', opts: { ...OLD_SPOT, disk: { rate: 4, mode: 'dash' }, spotRate: 8 } },
+  { id: 'd3', label: 'renkaat 12/s, piste 12/s', test: 'lepo', opts: { ...OLD_SPOT, spotRate: 12 } },
+  {
+    id: 'd4',
+    label: 'renkaat kiertyvät (transform) 12/s, piste 24/s',
+    test: 'lepo',
+    opts: { ...OLD_SPOT, disk: { rate: 12, mode: 'kierto' }, spotRate: 24 },
+  },
+  { id: 'd5', label: 'renkaat paikallaan, piste 24/s', test: 'lepo', opts: { ...OLD_SPOT, disk: { rate: 12, mode: 'paikallaan' }, spotRate: 24 } },
+  {
+    id: 'd6',
+    label: 'koko kiekko paikallaan',
+    test: 'lepo',
+    opts: { ...OLD_SPOT, disk: { rate: 12, mode: 'paikallaan' }, spotRate: 24 },
+    css: '.spot, .spotFront { animation-play-state: paused !important; }',
+  },
+  { id: 'd7', label: 'piste puolet hitaampi (16 s kierros), 12 askelta/s', test: 'lepo', opts: { spotSeconds: 16, spotRate: 12, spotTail: false } },
+  { id: 'd8', label: 'piste puolet hitaampi, 12 askelta/s, häntä (= 1.1.10 oletus)', test: 'lepo' },
+  // Erä K3-2 (1.1.10): perustaso ja silmän ja finaalin porrastus. Silmä ja finaali 12 s kohdalla.
+  { id: 'b12', label: 'oletus 1.1.10 (kaikki 12 askelta/s)', test: 'lepo' },
+  {
+    id: 'b24',
+    label: 'kaikki 24 askelta/s (renkaat, piste, tuike, syke, putoavat)',
+    test: 'lepo',
+    opts: { frameRate: 24, disk: { rate: 24, mode: 'dash' }, spotRate: 24 },
+  },
+  { id: 'e0', label: 'silmä sulava (1.1.13)', test: 'silma', lead: 12, opts: { spotTail: false, motionRate: 0 } },
+  { id: 'e24', label: 'silmä 24 askelta/s', test: 'silma', lead: 12, opts: { motionRate: 24, spotTail: false } },
+  { id: 'e12', label: 'silmä 12 askelta/s', test: 'silma', lead: 12, opts: { motionRate: 12, spotTail: false } },
+  { id: 'n0', label: 'finaali sulava (1.1.13)', test: 'finaali', lead: 12, opts: { spotTail: false, motionRate: 0 } },
+  { id: 'n24', label: 'finaali 24 askelta/s', test: 'finaali', lead: 12, opts: { motionRate: 24, spotTail: false } },
+  { id: 'n12', label: 'finaali 12 askelta/s', test: 'finaali', lead: 12, opts: { motionRate: 12, spotTail: false } },
+  // Erä K3-3 (1.1.11): mikä finaalissa on raskasta? Kaikki finaali 12 s kohdalla, 12 askelta/s.
+  { id: 'f0', label: 'finaali kokonaan', test: 'finaali', lead: 12, opts: FIN12 },
+  { id: 'f1', label: 'finaali ilman linssiä', test: 'finaali', lead: 12, opts: FIN12, css: NO_LENS },
+  { id: 'f2', label: 'finaali ilman jähmettynyttä kopiota', test: 'finaali', lead: 12, opts: FIN12, css: NO_FRZ },
+  { id: 'f3', label: 'finaali ilman pyramidia', test: 'finaali', lead: 12, opts: FIN12, css: NO_PYR },
+  { id: 'f4', label: 'finaali ilman linssiä ja kopiota', test: 'finaali', lead: 12, opts: FIN12, css: NO_LENS + NO_FRZ },
+  {
+    id: 'f5',
+    label: 'finaalista vain silmä',
+    test: 'finaali',
+    lead: 12,
+    opts: FIN12,
+    css: `${NO_LENS}${NO_FRZ}${NO_PYR} .cap { display: none !important; }`,
+  },
+  // Koe G1 (1.1.16): jäätyykö hyvin kevyt kuva myös noin 90 s latauksesta?
+  { id: 'p20', label: 'kevyt kuva: musta pohja ja 20 pistettä, 12 askelta/s', test: 'lepo', raw: KEVYT_SCENE },
+  // Koe G2 (1.1.17): lataako sovellus kehyksen uudelleen, ja mikä osa kuvasta jäätyy 90 s kohdalla?
+  { id: 'pb', label: 'kevyt kuva + purske vain latauksen 12 ensimmäistä sekuntia', test: 'lepo', raw: PURSKE_SCENE },
+  {
+    id: 'h1',
+    label: 'täysi kuva paikallaan (ei animaatioita, ei SMILiä) + vilkkuvat pisteet',
+    test: 'lepo',
+    css: `*:not(.kd) { animation: none !important; } ${ELO_CSS}`,
+    smil: 'pois',
+    extra: ELO_PISTEET,
+  },
+  // Koe G3 (1.1.18): uusi kello (yksi <animate>) vastaan vanha ketju.
+  { id: 'c0', label: 'täysi kuva, VANHA kello (72 itsensä käynnistävää ajastinta)', test: 'lepo', clock: 'ketju' },
+  { id: 'c1', label: 'täysi kuva, uusi kello (yksi toistuva animaatio)', test: 'lepo' },
+  // Koe G4 (1.1.19): sama kuva kokonaan ilman SMIL-ajastimia (aalto paikallaan, CSS-animaatiot ennallaan).
+  { id: 'm1', label: 'täysi kuva ilman yhtään SMIL-ajastinta', test: 'lepo', smil: 'pois' },
+  // Koe G5 (1.1.21): m1 jäätyi 90 s kohdalla (2/2), s7 (vain kiekko) ei. Mikä CSS-animaatioperhe?
+  // Kaikissa kiekko liikkuu (elonmerkki), SMIL pois, ja yksi perhe on päällä.
+  { id: 'a1', label: 'kiekko + pitkät siirrot (vaellus 704/476 s, kaaret 400 s)', test: 'lepo', smil: 'pois', css: onlyAnim('.driftX', '.driftY', '.lensArcs') },
+  { id: 'a2', label: 'kiekko + himmennykset (tuike, syke, imaisu, verkkobitit, häiriöviivat)', test: 'lepo', smil: 'pois', css: onlyAnim('.tw', '.beat', '.suck', '.net', '.gl') },
+  { id: 'a3', label: 'kiekko + putoavat bitit', test: 'lepo', smil: 'pois', css: onlyAnim('.fall', '.fallFront') },
+  // Koe G6 (1.1.22): a1, a2 ja a3 selvisivät kukin yli 2,5 min, m1 (kaikki) jäätyy 90 s. Parit:
+  { id: 'q12', label: 'kiekko + pitkät siirrot + himmennykset', test: 'lepo', smil: 'pois', css: onlyAnim(...ANIM_A1, ...ANIM_A2) },
+  { id: 'q13', label: 'kiekko + pitkät siirrot + putoavat', test: 'lepo', smil: 'pois', css: onlyAnim(...ANIM_A1, ...ANIM_A3) },
+  { id: 'q23', label: 'kiekko + himmennykset + putoavat', test: 'lepo', smil: 'pois', css: onlyAnim(...ANIM_A2, ...ANIM_A3) },
+  // Koe G7 (1.1.23): rakentaako sovellus taustan uudelleen 90 s kohdalla? Ikämittari (neliö / 10 s).
+  { id: 'r1', label: 'kevyt kuva + ikämittari (neliö syttyy 10 s välein)', test: 'lepo', raw: IKA_SCENE },
+  { id: 'r2', label: 'täysi kuva ilman SMILiä + ikämittari', test: 'lepo', smil: 'pois', css: IKA_CSS, extra: IKA_NELIOT },
+  // Koe G8 (1.1.24): korjausehdokas. Koko kuva (kello, silmä, finaali) ilman vaelluksen ja kaarten animaatiota.
+  // Perustelu: q23 ja q13 (kaksi perhettä kolmesta) selvisivät, m1 (kaikki kolme) jäätyy 90 s kohdalla.
+  {
+    id: 'k1',
+    label: 'koko kuva ilman hidasta vaellusta ja kaarten kiertoa + ikämittari',
+    test: 'lepo',
+    css: `${offAnim(...ANIM_A1)} ${IKA_CSS}`,
+    extra: IKA_NELIOT,
+  },
+]
+const VARIANTS: SarjaVariant[] = [...SARJA, ...KEVENNYS]
+
+// ═══ Automaattinen mittaus (kehitystä varten; julkaisussa AINA null) ═════════
+// Kun teema latautuu (istunnon alku tai koodin uudelleenlataus vuoron lopussa),
+// odotetaan `viive` s ja ajetaan `vaiheet` `kesto` s välein, sitten tavallinen kuva.
+// Toteutuneet hetket kirjataan $.store-avaimeen 'autokoe'. HUOM: ajetaan jokaisen
+// istunnon alussa, kunnes tämä on taas null.
+// Ajetaan vain istunnossa `istunto` (muut auki olevat istunnot lataavat teeman myös uudelleen).
+type Autokoe = { tunnus: string; istunto: string; viive: number; kesto: number; vaiheet: string[] }
+// Edellinen erä: { tunnus: 'K3-1 kiekko', istunto: '<istunnon id>', viive: 30,
+// kesto: 30, vaiheet: d0–d6 kahdesti }.
+// Edelliset erät: K3-2 (b12, e*, n*, b24), K3-3 (f0–f5), K3-4 (b12, e0/e12/e24, n0/n12/n24).
+// Koe G1 (1.1.16, tili 2): tavallinen kuva 150 s (vertailu), kevyt kuva 150 s, tavallinen kuva.
+// Koe G2 (1.1.17): purskekuva, paikallaan oleva täysi kuva, vain kiekko (CSS), vain kentän kello (SMIL).
+// Koe G3 (1.1.18): tavallinen kuva uudella kellolla 150 s, vanha kello 150 s, uusi kello 150 s, tavallinen.
+// Koe G4 (1.1.19): ilman SMILiä (m1) ja uudella kellolla (c1) vuorotellen, 100 s kukin.
+// Edellinen: { tunnus: 'G4 ilman SMILiä vastaan uusi kello', istunto: '<istunnon id>',
+// viive: 5, kesto: 100, vaiheet: ['m1', 'c1', 'm1', 'c1', 'm1'] }.
+const AUTOKOE = null as Autokoe | null
+
+// Mitä kuvan vaihtaminen tarvitsee istunnolta (hookin `$` käy sellaisenaan).
+type Host = {
+  theme: { set: (attributes: ThemeSetArgs) => Promise<ThemeResult> }
+  clock: { now: () => Promise<number>; after: TimerCall }
+  store: { set: (key: string, value: unknown) => Promise<void> }
+}
+
+// ─── Toistokoe (/singulariteetti-testi toisto) ──────────────────────────────
+// Jäätyykö tausta latautuessaan kuvan raskaudesta riippumatta, ja välttääkö
+// <img>-piirto (isInteractive: false, ei kehystä) jäätymisen? Raskas = täysi kuva
+// (lepo), kevyt = musta pohja ja yksi liikkuva piste. Kukin TOISTO_SECONDS.
+const TOISTO_SECONDS = 20
+const TOISTO_ROUNDS = 4
+const PIENI_SCENE = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice"><style>.d { animation: d 4s steps(48) infinite; } @keyframes d { from { transform: translate(1100px, 540px); } to { transform: translate(1260px, 540px); } }</style><rect width="1600" height="1000" fill="#07040a"/><circle class="d" cx="0" cy="0" r="6" fill="${HOT}"/></svg>`
+type ToistoVaihe = { id: string; label: string; heavy: boolean; img: boolean }
+const TOISTO_KIERROS: ToistoVaihe[] = [
+  { id: 'RK', label: 'raskas kehyksenä', heavy: true, img: false },
+  { id: 'KK', label: 'kevyt kehyksenä', heavy: false, img: false },
+  { id: 'RI', label: 'raskas kuvana', heavy: true, img: true },
+  { id: 'KI', label: 'kevyt kuvana', heavy: false, img: true },
+]
+const TOISTO: ToistoVaihe[] = Array.from({ length: TOISTO_ROUNDS }, () => TOISTO_KIERROS).flat()
+// Näkymät, jotka piirretään <img>-elementtinä (isInteractive: false).
+const imgScenes = new Set<string>()
+const KUVAKOE_SECONDS = 300 // pitkä kuvakoe: yli kolme kertaa "noin 90 s" -jäätymisen kohta
+
 // Piirretyt kuvat näkymän nimen mukaan: tavallinen ja viimeisin testi.
 const scenes = new Map<string, string>()
 let loadedAt = 0
 let testRuns = 0
+
+// Vianetsintä (1.1.15): tausta jäätyy noin 90 s latauksesta. Kirjataan jokainen theme.set ja
+// Backdrop-piirto (ui.render) aikaleimoineen $.store-avaimeen 'render-loki' (enintään 300),
+// jotta nähdään, piirtääkö sovellus taustan uudelleen jäätymishetkellä.
+const renderLog: [number, string, string][] = []
+// Kaikki auki olevat istunnot kirjoittavat samaan storeen: oma avain prosessille.
+const LOG_KEY = `render-loki-${Math.floor(Math.random() * 1e6)}`
+const note =(kind: string, scene: string, host: { store: { set: (key: string, value: unknown) => Promise<void> } }): void => {
+  try {
+    renderLog.push([Date.now(), kind, scene])
+    if (renderLog.length > 300) {
+      renderLog.shift()
+    }
+    host.store.set(LOG_KEY, renderLog).catch(() => undefined)
+  } catch {
+    // kirjaus ei saa koskaan estää piirtoa
+  }
+}
+
+// Uusi kuva ensin, vanhat testikuvat pois vasta sen jälkeen (ettei tausta välähdä).
+const showScene = async (host: Host, svg: string, label: string, img = false): Promise<ThemeResult> => {
+  testRuns += 1
+  const name = `${SCENE_NAME}-${label}-${testRuns}`
+  scenes.set(name, svg)
+  if (img) {
+    imgScenes.add(name)
+  }
+  note('theme.set', name, host)
+  const set = await host.theme.set(LOOK(name))
+  for (const key of [...scenes.keys()]) {
+    if (key !== SCENE_NAME && key !== name) {
+      scenes.delete(key)
+      imgScenes.delete(key)
+    }
+  }
+
+  return set
+}
+
+const startAuto = (host: Host, auto: Autokoe, loaded: number): void => {
+  for (const timer of seriesTimers) {
+    timer.cancel()
+  }
+  seriesTimers = []
+  const steps = auto.vaiheet.flatMap(id => VARIANTS.filter(v => v.id === id))
+  const log = { tunnus: auto.tunnus, kesto: auto.kesto, vaiheet: steps.map(v => v.id), vaihdot: [] as [string, number][] }
+  const record = (id: string, at: number): void => {
+    log.vaihdot.push([id, at])
+    host.store.set('autokoe', log).catch(() => undefined)
+  }
+  record('ladattu', loaded)
+  steps.forEach((variant, i) => {
+    seriesTimers.push(
+      host.clock.after((auto.viive + i * auto.kesto) * 1000, () => {
+        void host.clock.now().then(at => {
+          record(variant.id, at)
+
+          return showScene(host, sarjaScene(variant, at, loaded), `auto-${variant.id}`)
+        })
+      }),
+    )
+  })
+  seriesTimers.push(
+    host.clock.after((auto.viive + steps.length * auto.kesto) * 1000, () => {
+      void host.clock.now().then(at => {
+        record('tavallinen', at)
+
+        return showScene(host, buildScene(sceneOptions('pois', at, loaded)).svg, 'tavallinen')
+      })
+    }),
+  )
+}
 
 const ALT =
   'Musta singulariteetti, jonka punahehkuinen kertymäkiekko pyörii ja sykkii; varjon sisällä käynnistyy välillä robotin kylmän syaani digitaalinen silmä piirilevyn johtimineen, ja taustan bittikenttä himmenee joka lyönnillä. Kierroksen lopussa bitit kasautuvat pyramidiksi, jonka huippukiveen silmä siirtyy.'
@@ -1730,6 +2275,7 @@ export const register: Register = on => {
     loadedAt = await $.clock.now()
     scenes.clear()
     scenes.set(SCENE_NAME, buildScene(sceneOptions(TESTITILA, loadedAt, loadedAt)).svg)
+    note('theme.set', SCENE_NAME, $)
     const set = await $.theme.set(LOOK(SCENE_NAME))
 
     if (!set.isDrawn) {
@@ -1738,27 +2284,130 @@ export const register: Register = on => {
     try {
       await $.command.register({
         name: 'singulariteetti-testi',
-        description: 'Käynnistää teeman finaalin heti ("valkoinen": valkoinen aukko, "silmä": tavallinen silmä)',
+        description: 'Käynnistää teeman finaalin heti ("valkoinen": valkoinen aukko, "silmä": tavallinen silmä, "sarja": mittaussarja)',
       })
     } catch (error) {
       $.ui.toast(`Singulariteetti: testikomennon rekisteröinti epäonnistui (${String(error)})`)
+    }
+    if (AUTOKOE !== null && (await $.session.id().catch(() => '')) === AUTOKOE.istunto) {
+      startAuto($, AUTOKOE, loadedAt)
     }
 
     return next(e)
   })
 
+  // Vianetsintä (1.1.16): kirjataan myös, liittyykö tai irtoaako sovellus istunnosta ja
+  // ilmoittaako se piirtovirheestä. Vain havainnointi: tapahtuma jatkaa aina eteenpäin.
+  on('session.attach', ($, e, next) => {
+    note('attach', `${e.surface} ${e.clientId}`, $)
+
+    return next(e)
+  })
+  on('session.detach', ($, e, next) => {
+    note('detach', `${e.surface} ${e.clientId} ${String(e.reason)}`, $)
+
+    return next(e)
+  })
+  on('ui.fault', ($, e, next) => {
+    note('fault', `${e.surface} ${String(e.component)}`, $)
+
+    return next(e)
+  })
+
   on('command.run', { command: 'singulariteetti-testi' }, async ($, e) => {
-    const test: Testitila = /silm|eye/i.test(e.args) ? 'silma' : /valk|white/i.test(e.args) ? 'valkoinen' : 'finaali'
     const now = await $.clock.now()
-    testRuns += 1
-    const name = `${SCENE_NAME}-testi-${testRuns}`
-    for (const key of [...scenes.keys()]) {
-      if (key !== SCENE_NAME) {
-        scenes.delete(key)
+    const loaded = loadedAt === 0 ? now : loadedAt
+    const show = (svg: string, label: string, img = false): Promise<ThemeResult> => showScene($, svg, label, img)
+    for (const timer of seriesTimers) {
+      timer.cancel()
+    }
+    seriesTimers = []
+
+    if (/sarja|series/i.test(e.args)) {
+      const first = await show(sarjaScene(SARJA[0] ?? { id: 's0', label: '', test: 'lepo' }, now, loaded), 'sarja')
+      if (!first.isDrawn) {
+        return { text: `Teema ei piirry nyt: ${first.reason}` }
+      }
+      SARJA.forEach((variant, i) => {
+        if (i > 0) {
+          seriesTimers.push(
+            $.clock.after(i * SARJA_SECONDS * 1000, () => {
+              void $.clock.now().then(at => show(sarjaScene(variant, at, loaded), 'sarja'))
+            }),
+          )
+        }
+      })
+      seriesTimers.push(
+        $.clock.after(SARJA.length * SARJA_SECONDS * 1000, () => {
+          void $.clock.now().then(at => show(buildScene(sceneOptions('pois', at, loaded)).svg, 'tavallinen'))
+        }),
+      )
+      const total = SARJA.length * SARJA_SECONDS
+      const order = SARJA.map((v, i) => `${clockText(now + i * SARJA_SECONDS * 1000)}  ${v.id}  ${v.label}`).join('\n')
+
+      return {
+        text: `Mittaussarja alkoi klo ${clockText(now)}. Kuva vaihtuu itsestään ${SARJA_SECONDS} sekunnin välein, ${SARJA.length} vaihetta, yhteensä ${Math.floor(total / 60)} min ${total % 60} s. Sarja päättyy klo ${clockText(now + total * 1000)}, ja tavallinen tausta palaa.\n\n${order}\n\nPidä ikkuna näkyvissä äläkä koske hiireen tai näppäimistöön ennen klo ${clockText(now + total * 1000)}. Kirjoita sitten "valmis".`,
+        context: [`singulariteetti-sarja alku_epoch_ms=${now} vaihe_s=${SARJA_SECONDS} vaiheet=${SARJA.map(v => v.id).join(',')}`],
       }
     }
-    scenes.set(name, buildScene(sceneOptions(test, now, loadedAt === 0 ? now : loadedAt)).svg)
-    const set = await $.theme.set(LOOK(name))
+
+    if (/toisto|repeat/i.test(e.args)) {
+      const heavy = (at: number): string => sarjaScene(SARJA[0] ?? { id: 's0', label: '', test: 'lepo' }, at, loaded)
+      const step = (v: ToistoVaihe, at: number) => show(v.heavy ? heavy(at) : PIENI_SCENE, `toisto-${v.id}`, v.img)
+      const firstStep = TOISTO[0]
+      const first = firstStep === undefined ? undefined : await step(firstStep, now)
+      if (first !== undefined && !first.isDrawn) {
+        return { text: `Teema ei piirry nyt: ${first.reason}` }
+      }
+      TOISTO.forEach((v, i) => {
+        if (i > 0) {
+          seriesTimers.push(
+            $.clock.after(i * TOISTO_SECONDS * 1000, () => {
+              void $.clock.now().then(at => step(v, at))
+            }),
+          )
+        }
+      })
+      seriesTimers.push(
+        $.clock.after(TOISTO.length * TOISTO_SECONDS * 1000, () => {
+          void $.clock.now().then(at => show(buildScene(sceneOptions('pois', at, loaded)).svg, 'tavallinen'))
+        }),
+      )
+      const total = TOISTO.length * TOISTO_SECONDS
+      const end = clockText(now + total * 1000)
+      const order = TOISTO.map((v, i) => `${clockText(now + i * TOISTO_SECONDS * 1000)}  ${v.id}  ${v.label}`).join('\n')
+
+      return {
+        text: `Toistokoe alkoi klo ${clockText(now)}. Kuva vaihtuu itsestään ${TOISTO_SECONDS} sekunnin välein, ${TOISTO.length} vaihetta, yhteensä ${Math.floor(total / 60)} min ${total % 60} s. Kevyt kuva on musta pohja ja yksi liikkuva piste. Koe päättyy klo ${end}, ja tavallinen tausta palaa.\n\n${order}\n\nPidä ikkuna näkyvissä äläkä koske hiireen tai näppäimistöön ennen klo ${end}. Kirjoita sitten "valmis".`,
+        context: [`singulariteetti-toisto alku_epoch_ms=${now} vaihe_s=${TOISTO_SECONDS} vaiheet=${TOISTO.map(v => v.id).join(',')}`],
+      }
+    }
+
+    // Pitkä kuvakoe: tavallinen kuva <img>-elementtinä, finaali SARJA_LEAD s päästä.
+    if (/kuva|img/i.test(e.args)) {
+      const set = await show(buildScene({ ...sceneOptions('finaali', now, loaded), lead: SARJA_LEAD }).svg, 'kuva', true)
+      if (!set.isDrawn) {
+        return { text: `Teema ei piirry nyt: ${set.reason}` }
+      }
+      const end = clockText(now + KUVAKOE_SECONDS * 1000)
+
+      return {
+        text: `Kuvakoe alkoi klo ${clockText(now)}. Tausta piirretään nyt kuvana (ei kehystä). Finaali alkaa klo ${clockText(now + SARJA_LEAD * 1000)} ja kestää noin 11 sekuntia. Katso se. Sen jälkeen älä koske hiireen tai näppäimistöön ennen klo ${end}. Kirjoita sitten "valmis", ja kerro, näyttikö finaali samalta kuin ennen ja liikkuuko tausta yhä.`,
+        context: [`singulariteetti-kuvakoe alku_epoch_ms=${now} finaali_s=${SARJA_LEAD} kesto_s=${KUVAKOE_SECONDS}`],
+      }
+    }
+
+    const single = VARIANTS.find(v => new RegExp(`(^|\\s)${v.id}(\\s|$)`, 'i').test(e.args))
+    if (single !== undefined) {
+      const set = await show(sarjaScene(single, now, loaded), single.id)
+
+      return set.isDrawn
+        ? { text: `Variantti ${single.id} (${single.label}) piirtyi klo ${clockText(now)}.`, context: [`singulariteetti-variantti ${single.id} epoch_ms=${now}`] }
+        : { text: `Teema ei piirry nyt: ${set.reason}` }
+    }
+
+    const test: Testitila = /silm|eye/i.test(e.args) ? 'silma' : /valk|white/i.test(e.args) ? 'valkoinen' : 'finaali'
+    const set = await show(buildScene(sceneOptions(test, now, loaded)).svg, 'testi')
 
     if (!set.isDrawn) {
       return { text: `Teema ei piirry nyt: ${set.reason}` }
@@ -1776,8 +2425,13 @@ export const register: Register = on => {
     if (e.surface !== 'desktop' && e.surface !== 'mobile') {
       return next(e)
     }
-    let source = scenes.get(e.props.scene) ?? scenes.get(SCENE_NAME)
+    let name = e.props.scene
+    let source = scenes.get(name)
 
+    if (source === undefined) {
+      name = SCENE_NAME
+      source = scenes.get(SCENE_NAME)
+    }
     if (source === undefined) {
       source = buildScene(sceneOptions(TESTITILA, loadedAt, loadedAt)).svg
       scenes.set(SCENE_NAME, source)
@@ -1785,6 +2439,8 @@ export const register: Register = on => {
 
     const { Svg } = $.ui.resolve(e)
 
-    return <Svg source={source} alt={ALT} isInteractive />
+    note('render', name, $)
+
+    return <Svg source={source} alt={ALT} isInteractive={!imgScenes.has(name)} />
   })
 }
