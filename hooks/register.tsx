@@ -277,9 +277,17 @@ const rise = (dy: number, start: number, end: number, opacity: number): Frame[] 
 }
 const fade = (points: [number, number][]): Frame[] => points.map(([s, o]): Frame => [s, `opacity: ${o};`])
 
+// Pyramidin bitit (1.3.2) kertovat tekstin OSIRIS-001 ASCII-koodeina, luettuna kuin
+// tekstiä: ylimmästä rivistä alas, vasemmalta oikealle. 10 merkkiä × 8 bittiä = 80
+// bittiä, täsmälleen pyramidin koko (3 + 5 + … + 17). Jokaisen merkin ensimmäinen
+// bitti on magenta, joten merkit erottuvat toisistaan.
+const PYR_MESSAGE = 'OSIRIS-001'
+const PYR_BITS = [...PYR_MESSAGE].map(ch => ch.charCodeAt(0).toString(2).padStart(8, '0')).join('')
+
 // Pyramidin bittirivit: ylin 3 bittiä, alin 17. Alin nousee ensin, ylin palaa ensin.
 const pyrRows: string[] = []
 const pyrFrames: string[] = []
+let pyrBit = 0
 for (let i = 0; i < PYR_ROWS; i++) {
   const k = PYR_ROWS - 1 - i // 0 = alin rivi
   const y = PYR_BASE_Y - k * PYR_ROW_H
@@ -287,8 +295,9 @@ for (let i = 0; i < PYR_ROWS; i++) {
   const cells: string[] = []
   for (let j = 0; j < count; j++) {
     const x = PX + (j - (count - 1) / 2) * PYR_PITCH
-    const fill = rand() < 0.18 ? ` fill="${MAGENTA}"` : ''
-    cells.push(`<text x="${x.toFixed(1)}" y="${y}"${fill}>${rand() < 0.5 ? 0 : 1}</text>`)
+    const fill = pyrBit % 8 === 0 ? ` fill="${MAGENTA}"` : ''
+    cells.push(`<text x="${x.toFixed(1)}" y="${y}"${fill}>${PYR_BITS.charAt(pyrBit % PYR_BITS.length)}</text>`)
+    pyrBit += 1
   }
   pyrRows.push(`<g class="pyr pr${k}">${cells.join('')}</g>`)
   pyrFrames.push(`.pr${k} { animation-name: pr${k}; }`, pyrKeyframes(`pr${k}`, rise(PY - (y - 4), 1 + 0.55 * k, 30 + 0.4 * i, 0.85)))
@@ -584,7 +593,7 @@ export const register: Register = on => {
     return (
       <Svg
         source={scenes.get(e.props.scene) ?? scenes.get(SCENE_NAME) ?? scene(PYRAMID_FIRST)}
-        alt="Musta aukko, jonka hohtava kertymäkiekko taittuu sen ympäri; koko taustan yli liukuu himmeä bittikenttä, ja harvoin aukosta nousee pyramidi, jonka huippukiven silmä katsoo ympärilleen"
+        alt="Musta aukko, jonka hohtava kertymäkiekko taittuu sen ympäri; koko taustan yli liukuu himmeä bittikenttä, ja harvoin aukosta nousee pyramidi, jonka bitit kertovat binäärinä OSIRIS-001 ja jonka huippukiven silmä katsoo ympärilleen"
         isInteractive
       />
     )
