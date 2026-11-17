@@ -1,6 +1,6 @@
 {
   "name": "singulariteetti",
-  "description": "Singulariteetti, a menacing animated sci-fi theme for the Claude Code desktop app.",
+  "description": "Neonhorisontti, a calm animated neon sci-fi theme for the Claude Code desktop app.",
   "owner": { "name": "tion420" },
   "plugins": [{ "name": "singulariteetti", "source": "./" }]
 }
